@@ -18,6 +18,7 @@ use Doctrine\DBAL\Connection;
 
 class ConvertXmlTextToRichTextCommand extends ContainerAwareCommand
 {
+    const MAX_OJBECTS_PER_CHILD = 1000;
     /**
      * @var \Doctrine\DBAL\Connection
      */
@@ -32,6 +33,16 @@ class ConvertXmlTextToRichTextCommand extends ContainerAwareCommand
      * @var RichTextConverter
      */
     private $converter;
+
+    /**
+     * @var array
+     */
+    protected $processes = [];
+
+    /**
+     * @var int
+     */
+    protected $maxConcurrency;
 
     public function __construct(Connection $dbal, RichTextConverter $converter, LoggerInterface $logger)
     {
@@ -53,6 +64,13 @@ Converts XmlText fields from eZ Publish Platform to RichText fields.
 
 This is a non-finalized work in progress. ALWAYS make sure you have a restorable backup of your database before using it.
 EOT
+            )
+            ->addOption(
+                'concurrency',
+                null,
+                InputOption::VALUE_OPTIONAL,
+                'Number of child processes to use when converting fields.',
+                1
             )
             ->addOption(
                 'dry-run',
@@ -103,6 +121,14 @@ EOT
             $dryRun = true;
         }
 
+        $this->maxConcurrency = $input->getOption('concurrency');
+        if (!is_numeric($this->maxConcurrency) || $this->maxConcurrency < 1) {
+            throw new RuntimeException('Invalid value for "--concurrency" given');
+        }
+        if ($input->getOption('fix-embedded-images-only') && $this->maxConcurrency !== 1) {
+            throw new RuntimeException('Multi concurrency is not supported together with the --fix-embedded-images-only option');
+        }
+
         $testContentId = $input->getOption('test-content-object');
 
         if ($input->getOption('image-content-types')) {
@@ -129,7 +155,7 @@ EOT
             $dryRun = true;
         }
 
-        $this->convertFields($dryRun, $testContentId, !$input->getOption('disable-duplicate-id-check'), !$input->getOption('disable-id-value-check'), $output);
+        $this->processFields($dryRun, $testContentId, !$input->getOption('disable-duplicate-id-check'), !$input->getOption('disable-id-value-check'), $output);
     }
 
     protected function getContentTypeIds($contentTypeIdentifiers)
@@ -276,11 +302,16 @@ EOT
     }
 
     /**
+     * Get the specified field rows.
+     * Note that if $contentId !== null, then $offset and $limit will be ignored.
+     *
      * @param $datatypeString
      * @param $contentId
+     * @param $offset
+     * @param $limit
      * @return \Doctrine\DBAL\Driver\Statement|int
      */
-    protected function getFieldRows($datatypeString, $contentId)
+    protected function getFieldRows($datatypeString, $contentId, $offset, $limit)
     {
         $query = $this->dbal->createQueryBuilder();
         $query->select('a.*')
@@ -291,9 +322,13 @@ EOT
                     ':datatypestring'
                 )
             )
+            ->orderBy('a.id')
             ->setParameter(':datatypestring', $datatypeString);
 
-        if ($contentId !== null) {
+        if ($contentId === null) {
+            $query->setFirstResult($offset)
+                ->setMaxResults($limit);
+        } else {
             $query->andWhere(
                 $query->expr()->eq(
                     'a.contentobject_id',
@@ -336,14 +371,76 @@ EOT
         }
     }
 
-    protected function convertFields($dryRun, $contentId, $checkDuplicateIds, $checkIdValues, OutputInterface $output)
+    protected static function fork()
     {
-        $count = $this->getRowCountOfContentObjectAttributes('ezxmltext', $contentId);
+        $pid = pcntl_fork();
 
-        $output->writeln("Found $count field rows to convert.");
+        if ($pid === -1) {
+            throw new \Exception('Could not fork background process.');
+        }
 
-        $statement = $this->getFieldRows('ezxmltext', $contentId);
+        return $pid;
+    }
 
+    protected function waitForAvailableProcessSlot()
+    {
+        if (count($this->processes) >= $this->maxConcurrency) {
+            $this->waitForChild();
+        }
+    }
+
+    protected function terminateAllChildren()
+    {
+        foreach ($this->processes as $pid => $process) {
+            posix_kill($pid, SIGKILL);
+        }
+        foreach ($this->processes as $pid => $process) {
+            pcntl_waitpid($pid, $status);
+        }
+    }
+
+    protected function waitForChild()
+    {
+        $pid = pcntl_wait($status);
+        $exitProcess = $this->processes[$pid];
+        unset($this->processes[$pid]);
+
+        if (pcntl_wifexited($status)) {
+            $exitStatus = pcntl_wexitstatus($status);
+
+            if ($exitStatus !== 0) {
+                $this->terminateAllChildren();
+                throw new RuntimeException(sprintf('Child process (offset=%s, limit=%s) ended with status code %d. Terminating', $exitProcess['offset'], $exitProcess['limit'], $exitStatus));
+            }
+        } else {
+            $this->terminateAllChildren();
+            throw new RuntimeException(sprintf('Child process (offset=%s, limit=%s) ended for unknown reason. Terminating', $exitProcess['offset'], $exitProcess['limit']));
+        }
+    }
+
+    protected function launchConvertFields($dryRun, $contentId, $checkDuplicateIds, $checkIdValues, OutputInterface $output, $offset, $limit, $fork)
+    {
+        if ($fork) {
+            $conn = $this->getContainer()->get('doctrine')->getConnection();
+            $conn->close();
+            $this->waitForAvailableProcessSlot();
+            $pid = self::fork();
+            if ($pid === 0) {
+                $conn->connect();
+                // This is the child process
+                $this->convertFields($dryRun, $contentId, $checkDuplicateIds, $checkIdValues, $output, $offset, $limit, $fork);
+                exit(0);
+            }
+            $this->processes[$pid] = ['offset' => $offset, 'limit' => $limit];
+            $conn->connect();
+        } else {
+            $this->convertFields($dryRun, $contentId, $checkDuplicateIds, $checkIdValues, $output, $offset, $limit, $fork);
+        }
+    }
+
+    protected function convertFields($dryRun, $contentId, $checkDuplicateIds, $checkIdValues, OutputInterface $output, $offset, $limit, $fork)
+    {
+        $statement = $this->getFieldRows('ezxmltext', $contentId, $offset, $limit);
         while ($row = $statement->fetch(PDO::FETCH_ASSOC)) {
             if (empty($row['data_text'])) {
                 $inputValue = Value::EMPTY_VALUE;
@@ -363,7 +460,24 @@ EOT
                 ]
             );
         }
+    }
 
+    protected function processFields($dryRun, $contentId, $checkDuplicateIds, $checkIdValues, OutputInterface $output)
+    {
+        $count = $this->getRowCountOfContentObjectAttributes('ezxmltext', $contentId);
+        $output->writeln("Found $count field rows to convert.");
+
+        $offset = 0;
+        $fork = $this->maxConcurrency > 1 && $contentId === null;
+
+        while ($offset + self::MAX_OJBECTS_PER_CHILD <= $count) {
+            $this->launchConvertFields($dryRun, $contentId, $checkDuplicateIds, $checkIdValues, $output, $offset, self::MAX_OJBECTS_PER_CHILD, $fork);
+            $offset += self::MAX_OJBECTS_PER_CHILD;
+        }
+
+        while (count($this->processes) > 1) {
+            $this->waitForChild();
+        }
         $output->writeln("Converted $count ezxmltext fields to richtext");
     }
 
